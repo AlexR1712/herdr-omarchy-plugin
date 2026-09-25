@@ -32,7 +32,7 @@ The installer validates the manifest, copies the plugin to `~/.config/omarchy/pl
 
 Click the icon to open the panel; middle-click to refresh. The bar polls every 12 seconds, or every 5 seconds while the panel is open. The small animation runs only while the panel is open and work is active.
 
-An unavailable machine appears as offline. Global counts include only machines that responded, and the panel marks the snapshot as partial. The plugin queries remote machines in parallel with a four-second timeout per machine. A short-lived per-user cache prevents separate bar instances from repeating the same SSH queries.
+A machine that does not respond appears as unavailable; a timeout is labeled `TIMED OUT` because it does not prove the machine is offline. Global counts include only machines that responded, and the panel marks the snapshot as partial. The plugin queries remote machines in parallel with a 30-second timeout per machine to allow a cold SSH connection and Herdr remote bridge to start. A short-lived per-user cache prevents separate bar instances from repeating the same SSH queries; concurrent instances wait for that refresh to complete.
 
 Project and task names come directly from Herdr and keep their original language. All interface labels are in English.
 

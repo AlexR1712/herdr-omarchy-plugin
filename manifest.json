@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "herdr-overview",
   "name": "Herdr Overview",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Alex",
   "license": "UNLICENSED",
   "description": "A live Herdr agent overview for the Omarchy bar.",

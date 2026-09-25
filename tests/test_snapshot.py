@@ -95,6 +95,27 @@ class SnapshotTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertNotIn(("disabled", "Disabled"), machines)
 
+    def test_remote_snapshot_timeout_covers_cold_ssh_startup(self):
+        """Remote snapshots need enough time for a healthy slow response."""
+        with patch.object(overview, "run_json", return_value=(self.fixture(), None)) as run_json:
+            machine = overview.collect_machine("remote", "Devbox", ["herdr", "--machine", "remote", "api", "snapshot"])
+        self.assertTrue(machine["available"])
+        self.assertEqual(run_json.call_args.args[1], overview.SNAPSHOT_TIMEOUT)
+        self.assertGreaterEqual(overview.SNAPSHOT_TIMEOUT, 3 * overview.MACHINE_LIST_TIMEOUT)
+        self.assertGreaterEqual(overview.SNAPSHOT_TIMEOUT, 30)
+
+    def test_lock_wait_covers_a_full_uncached_refresh(self):
+        """Concurrent bar instances must wait for a remote refresh to fill the cache."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "overview.json"
+            fresh = {"available": True, "machines": []}
+            with patch.object(overview, "cache_location", return_value=path), patch.object(
+                overview, "read_cache", side_effect=[None, fresh]
+            ), patch.object(
+                overview.fcntl, "flock", side_effect=[BlockingIOError, BlockingIOError, None, None]
+            ), patch.object(overview.time, "monotonic", side_effect=[0, 1, 18]), patch.object(overview.time, "sleep"):
+                self.assertEqual(overview.get_snapshot(), fresh)
+
     def test_machine_catalog_failure_is_explicit_partial_machine(self):
         with patch.object(overview, "list_machines", return_value=([], "machine catalog timed out")), patch.object(
             overview, "collect_machine", return_value=overview.normalize_machine(self.fixture(), "local", "Local")

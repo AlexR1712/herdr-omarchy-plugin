@@ -51,7 +51,7 @@ BarWidget {
     anchors.fill: parent
     bar: root.bar
     tooltipText: root.iconState === "error" && root.attentionCount === 0
-      ? "Herdr: one or more machines are unavailable"
+      ? "Herdr: one or more machines did not respond"
       : root.globalState === "attention"
       ? "Herdr: " + root.attentionCount + " need" + (root.attentionCount === 1 ? "s" : "") + " attention"
       : root.globalState === "working"

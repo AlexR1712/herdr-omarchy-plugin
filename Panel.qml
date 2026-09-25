@@ -49,14 +49,14 @@ Panel {
     : !available || allCount === 0 ? "No Herdr agents yet"
     : waitingCount > 0 ? waitingCount + " need" + (waitingCount === 1 ? "s" : "") + " input"
     : reviewCount > 0 ? reviewCount + " output" + (reviewCount === 1 ? " needs" : "s need") + " review"
-    : partial ? "Some machines are unavailable"
+    : partial ? "Some machines did not respond"
     : workingCount > 0 ? workingCount + " agent" + (workingCount === 1 ? " running" : "s running")
     : "Everything is quiet"
   readonly property string statusDetail: loadError !== "" ? "Refresh to retry the local status check."
     : !available ? "Agents appear here when Herdr publishes activity."
     : waitingCount > 0 ? "A decision or response is needed to continue."
     : reviewCount > 0 ? "Inspect the completed output before moving on."
-    : partial ? "Counts include online machines only."
+    : partial ? "Counts include machines that responded."
     : workingCount > 0 ? "Status refreshes automatically while work continues."
     : "There is no output or input waiting."
 
@@ -91,6 +91,10 @@ Panel {
   }
   function worktreeAgents(worktree) { return worktree && worktree.agents ? worktree.agents : [] }
   function countLabel(value, noun) { return value + " " + noun + (value === 1 ? "" : "s") }
+  function machineAvailabilityLabel(machine) {
+    var error = String(machine && machine.error || "").toLowerCase()
+    return error.indexOf("timed out") >= 0 ? "TIMED OUT" : "UNAVAILABLE"
+  }
   function machineIconState(machine) {
     if (!machine || machine.available === false || !!machine.error) return "error"
     var t = machine.totals || ({})
@@ -270,7 +274,7 @@ Panel {
                   Text { width: Math.max(0, parent.width - machineMeta.implicitWidth - Style.space(32)); text: String(modelData.name || modelData.id || "Machine"); textFormat: Text.PlainText; color: root.foreground; font.family: root.bar ? root.bar.fontFamily : Style.font.family; font.pixelSize: Style.font.body; font.bold: true; elide: Text.ElideRight }
                   Text {
                     id: machineMeta
-                    text: machineUnavailable ? "OFFLINE" : root.countLabel(Number((modelData.totals || {}).all || 0), "agent")
+                    text: machineUnavailable ? root.machineAvailabilityLabel(modelData) : root.countLabel(Number((modelData.totals || {}).all || 0), "agent")
                     color: root.agentTint(machineState)
                     font.family: root.bar ? root.bar.fontFamily : Style.font.family; font.pixelSize: Style.font.caption; font.bold: true; font.letterSpacing: 0.45
                   }

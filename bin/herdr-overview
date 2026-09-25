@@ -25,10 +25,15 @@ import fcntl
 STATUS_GLYPHS = re.compile(r"^[\s\u2800-\u28ff●◉◑○•▪▫◆◇★☆✓✗⚠⚡✳▶▷▸▹⏳…]+")
 WHITESPACE = re.compile(r"\s+")
 TOTAL_KEYS = ("all", "working", "review", "waiting", "idle", "other")
-SNAPSHOT_TIMEOUT = 4
+# A saved machine may need to establish SSH and start its remote bridge before
+# it can answer. A healthy machine took 17 seconds in a live snapshot check.
+SNAPSHOT_TIMEOUT = 30
 MACHINE_LIST_TIMEOUT = 2
 CACHE_TTL_SECONDS = 7
-LOCK_WAIT_SECONDS = 8
+# A concurrent bar instance waits for the current refresh to populate the
+# cache.  Include catalog discovery, the longest per-machine snapshot, and a
+# small scheduling allowance so contention never turns into a false error.
+LOCK_WAIT_SECONDS = MACHINE_LIST_TIMEOUT + SNAPSHOT_TIMEOUT + 5
 
 
 def now() -> str:
