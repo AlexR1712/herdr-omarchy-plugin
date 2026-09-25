@@ -1,0 +1,17 @@
+{
+  "result": {
+    "snapshot": {
+      "workspaces": [
+        {"workspace_id": "ws-api", "label": "API", "worktree": {"repo_key": "repo-portal", "repo_name": "customer-portal", "repo_root": "/code", "checkout_path": "/code/api", "is_linked_worktree": false}},
+        {"workspace_id": "ws-web", "label": "Web", "worktree": {"repo_key": "repo-portal", "repo_name": "customer-portal", "repo_root": "/code", "checkout_path": "/code/web", "is_linked_worktree": true}}
+      ],
+      "agents": [
+        {"agent": "codex", "pane_id": "11", "agent_status": "working", "workspace_id": "ws-api", "cwd": "/code/api", "name": "● API migration", "terminal_title_stripped": "⠸✳◑ Ignored title | API"},
+        {"agent": "codex", "pane_id": "12", "agent_status": "done", "workspace_id": "ws-web", "foreground_cwd": "/code/web", "terminal_title_stripped": "✓ Visual check | Web"},
+        {"agent": "claude", "agent_session": {"value": "session-blocked"}, "agent_status": "blocked", "workspace_id": "ws-api", "cwd": "/code/api", "name": "⚠ Waiting for token"},
+        {"agent": "codex", "pane_id": "14", "agent_status": "mystery", "cwd": "/code/misc", "terminal_title_stripped": "• Misc task"},
+        {"agent": "codex", "pane_id": "15", "agent_status": "idle", "workspace_id": "ws-web", "cwd": "/code/web", "terminal_title_stripped": "◉ Seen result | Web"}
+      ]
+    }
+  }
+}

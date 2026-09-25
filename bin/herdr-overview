@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""Read a Herdr snapshot and emit a compact, UI-ready overview as JSON.
+
+This command is deliberately read-only: it runs ``herdr api snapshot`` and makes
+no changes to Herdr, terminals, or workspaces.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import posixpath
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import fcntl
+
+STATUS_GLYPHS = re.compile(r"^[\s\u2800-\u28ff●◉◑○•▪▫◆◇★☆✓✗⚠⚡✳▶▷▸▹⏳…]+")
+WHITESPACE = re.compile(r"\s+")
+TOTAL_KEYS = ("all", "working", "review", "waiting", "idle", "other")
+SNAPSHOT_TIMEOUT = 4
+MACHINE_LIST_TIMEOUT = 2
+CACHE_TTL_SECONDS = 7
+LOCK_WAIT_SECONDS = 8
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def clean_text(value: Any) -> str:
+    """Remove terminal status decoration while preserving the supplied wording."""
+    if not isinstance(value, str):
+        return ""
+    return WHITESPACE.sub(" ", STATUS_GLYPHS.sub("", value)).strip()
+
+
+def task_summary(title: Any) -> str:
+    """Keep the task portion of a terminal title, excluding a trailing project label."""
+    text = clean_text(title)
+    return clean_text(text.rsplit(" | ", 1)[0]) if " | " in text else text
+
+
+def session_id(value: Any) -> str:
+    if isinstance(value, dict):
+        return clean_text(value.get("value"))
+    return clean_text(value)
+
+
+def provider_name(kind: str, agent_id: str) -> str:
+    """A compact row label when Herdr did not supply a pane name."""
+    provider = kind.replace("_", " ").replace("-", " ").title() or "Agent"
+    return f"{provider} · {agent_id}" if agent_id else provider
+
+
+def status_info(raw_status: Any) -> tuple[str, str]:
+    """Map Herdr's documented agent lifecycle into overview buckets."""
+    status = clean_text(raw_status).lower()
+    if status == "working":
+        return "working", "working"
+    if status == "done":
+        return "review", "review"
+    if status == "blocked":
+        return "waiting", "attention"
+    if status == "idle":
+        return "idle", "idle"
+    if status in {"waiting", "queued", "pending"}:
+        return "waiting", "waiting"
+    return "other", "other"
+
+
+def empty_totals() -> dict[str, int]:
+    return {key: 0 for key in TOTAL_KEYS}
+
+
+def add_total(totals: dict[str, int], bucket: str) -> None:
+    totals["all"] += 1
+    totals[bucket] += 1
+
+
+def project_priority(project: dict[str, Any]) -> tuple[Any, ...]:
+    totals = project["totals"]
+    # Needs-input projects lead, then active work, then review workload.
+    return (-totals["waiting"], -totals["working"], -totals["review"], -totals["all"], project["name"].lower())
+
+
+def empty_machine(machine_id: str, name: str, error: str | None = None) -> dict[str, Any]:
+    machine = {"id": machine_id, "name": name, "available": error is None, "totals": empty_totals(), "spaces": []}
+    if error:
+        machine["error"] = error
+    return machine
+
+
+def workspace_path(workspace: dict[str, Any]) -> str:
+    worktree = workspace.get("worktree")
+    return clean_text(worktree.get("checkout_path")) if isinstance(worktree, dict) else ""
+
+
+def get_or_create_worktree(
+    spaces: dict[str, dict[str, Any]], workspace: dict[str, Any], fallback_path: str = ""
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Use snapshot workspace/worktree metadata; paths only fill missing metadata."""
+    workspace_id = clean_text(workspace.get("workspace_id")) or "unassigned"
+    label = clean_text(workspace.get("label")) or workspace_id
+    worktree = workspace.get("worktree")
+    if isinstance(worktree, dict):
+        path = clean_text(worktree.get("checkout_path")) or fallback_path
+        space_id = clean_text(worktree.get("repo_key")) or workspace_id
+        space_name = clean_text(worktree.get("repo_name")) or label
+        space_path = clean_text(worktree.get("repo_root"))
+        kind = "worktree"
+        worktree_name = "Primary checkout" if not worktree.get("is_linked_worktree") and label == space_name else label
+    else:
+        path = fallback_path
+        space_id = f"workspace:{workspace_id}"
+        space_name = label
+        space_path = ""
+        kind = "workspace"
+        worktree_name = "Workspace" if label == space_name else label
+    space = spaces.setdefault(
+        space_id, {"id": space_id, "name": space_name, "path": space_path, "totals": empty_totals(), "worktrees": []}
+    )
+    existing = next((item for item in space["worktrees"] if item["id"] == workspace_id), None)
+    if existing is None:
+        existing = {"id": workspace_id, "name": worktree_name, "kind": kind, "path": path, "totals": empty_totals(), "agents": []}
+        space["worktrees"].append(existing)
+    elif not existing["path"] and path:
+        existing["path"] = path
+    return space, existing
+
+
+def normalize_machine(snapshot: dict[str, Any], machine_id: str, machine_name: str) -> dict[str, Any]:
+    """Normalize one machine using exact agent→workspace→worktree relationships."""
+    result = snapshot.get("result") if isinstance(snapshot, dict) else None
+    root = result.get("snapshot") if isinstance(result, dict) else {}
+    raw_agents = root.get("agents", []) if isinstance(root, dict) else []
+    raw_workspaces = root.get("workspaces", []) if isinstance(root, dict) else []
+    if not isinstance(raw_agents, list):
+        raw_agents = []
+    if not isinstance(raw_workspaces, list):
+        raw_workspaces = []
+
+    machine = empty_machine(machine_id, machine_name)
+    workspaces = {clean_text(item.get("workspace_id")): item for item in raw_workspaces if isinstance(item, dict)}
+    spaces: dict[str, dict[str, Any]] = {}
+    # Keep opened worktrees visible even if they currently have no detected agents.
+    for workspace in workspaces.values():
+        get_or_create_worktree(spaces, workspace)
+    agents: list[dict[str, Any]] = []
+
+    for index, item in enumerate(raw_agents):
+        if not isinstance(item, dict):
+            continue
+        workspace_id = clean_text(item.get("workspace_id"))
+        path = clean_text(item.get("foreground_cwd")) or clean_text(item.get("cwd"))
+        workspace = workspaces.get(workspace_id)
+        relation = "workspace"
+        if workspace is None and path:
+            candidates = [(workspace_path(value), value) for value in workspaces.values()]
+            matches = [(candidate_path, value) for candidate_path, value in candidates if candidate_path and (path == candidate_path or path.startswith(candidate_path.rstrip("/") + "/"))]
+            if matches:
+                workspace = max(matches, key=lambda match: len(match[0]))[1]
+                relation = "path"
+        if workspace is not None:
+            space, worktree = get_or_create_worktree(spaces, workspace, path)
+        else:
+            relation = "unassigned"
+            compact_path_name = posixpath.basename(path.rstrip("/")) if path else "Unassigned"
+            fallback_workspace = {"workspace_id": f"unassigned:{path or index}", "label": compact_path_name}
+            space, worktree = get_or_create_worktree(spaces, fallback_workspace, path)
+
+        bucket, state = status_info(item.get("agent_status"))
+        # `agent` identifies the provider (for example codex), not an individual run.
+        agent_id = clean_text(item.get("pane_id")) or session_id(item.get("agent_session")) or str(index + 1)
+        kind = clean_text(item.get("agent"))
+        explicit_name = clean_text(item.get("name"))
+        title = clean_text(item.get("terminal_title_stripped"))
+        summary = task_summary(title) or explicit_name or agent_id
+        agent = {
+            "id": f"{machine_id}:{agent_id}",
+            "pane_id": agent_id,
+            "name": explicit_name or provider_name(kind, agent_id),
+            "summary": summary,
+            "kind": kind,
+            "status": clean_text(item.get("agent_status")).lower() or "unknown",
+            "state": state,
+            "machine_id": machine_id,
+            "space_id": space["id"],
+            "worktree_id": worktree["id"],
+            "relation": relation,
+        }
+        agents.append(agent)
+        worktree["agents"].append(agent)
+        add_total(machine["totals"], bucket)
+        add_total(space["totals"], bucket)
+        add_total(worktree["totals"], bucket)
+
+    ordered_spaces = sorted(spaces.values(), key=project_priority)
+    for space in ordered_spaces:
+        space["worktrees"].sort(key=project_priority)
+        for worktree in space["worktrees"]:
+            worktree["agents"].sort(key=lambda agent: (agent["state"] != "attention", agent["name"].lower()))
+    machine["spaces"] = ordered_spaces
+    machine["agents"] = agents
+    return machine
+
+
+def normalize(snapshot: dict[str, Any], updated_at: str | None = None) -> dict[str, Any]:
+    """Normalize a local snapshot into the multi-machine overview schema."""
+    machine = normalize_machine(snapshot, "local", "Local")
+    return overview_from_machines([machine], updated_at)
+
+
+def overview_from_machines(machines: list[dict[str, Any]], updated_at: str | None = None) -> dict[str, Any]:
+    totals = empty_totals()
+    agents: list[dict[str, Any]] = []
+    machine_views = []
+    for machine in machines:
+        if not machine["available"]:
+            machine_views.append(dict(machine))
+            continue
+        agents.extend(machine.get("agents", []))
+        for key in TOTAL_KEYS:
+            totals[key] += machine["totals"][key]
+        machine_views.append({key: value for key, value in machine.items() if key != "agents"})
+    available = any(machine["available"] for machine in machines)
+    return {"available": available, "partial": available and any(not machine["available"] for machine in machines), "updated_at": updated_at or now(), "totals": totals, "machines": machine_views, "agents": agents}
+
+
+def unavailable(error: str) -> dict[str, Any]:
+    return {"available": False, "partial": False, "updated_at": now(), "error": error, "totals": empty_totals(), "machines": [], "agents": []}
+
+
+def valid_snapshot(payload: Any) -> bool:
+    result = payload.get("result") if isinstance(payload, dict) else None
+    return isinstance(result, dict) and isinstance(result.get("snapshot"), dict)
+
+
+def run_json(command: list[str], timeout: int) -> tuple[Any | None, str | None]:
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+    except FileNotFoundError:
+        return None, "herdr command unavailable"
+    except subprocess.TimeoutExpired:
+        return None, "timed out"
+    except OSError as exc:
+        return None, exc.strerror or "system error"
+    if completed.returncode != 0:
+        detail = clean_text(completed.stderr) or "command failed"
+        return None, detail[:160]
+    try:
+        return json.loads(completed.stdout), None
+    except json.JSONDecodeError:
+        return None, "returned invalid JSON"
+
+
+def list_machines() -> tuple[list[tuple[str, str]], str | None]:
+    payload, error = run_json(["herdr", "machine", "list", "--json"], MACHINE_LIST_TIMEOUT)
+    if error:
+        return [], f"machine catalog {error}"
+    if not isinstance(payload, list):
+        return [], "machine catalog returned unexpected JSON"
+    machines = []
+    for item in payload:
+        if not isinstance(item, dict) or item.get("enabled") is False:
+            continue
+        machine_id = clean_text(item.get("id"))
+        if machine_id:
+            machines.append((machine_id, clean_text(item.get("label")) or machine_id))
+    return machines, None
+
+
+def collect_machine(machine_id: str, name: str, command: list[str]) -> dict[str, Any]:
+    payload, error = run_json(command, SNAPSHOT_TIMEOUT)
+    if error:
+        return empty_machine(machine_id, name, f"snapshot {error}")
+    if not valid_snapshot(payload):
+        return empty_machine(machine_id, name, "snapshot has unexpected shape")
+    return normalize_machine(payload, machine_id, name)
+
+
+def cache_location() -> Path | None:
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        candidate = Path(runtime)
+        try:
+            metadata = candidate.stat()
+            if candidate.is_dir() and metadata.st_uid == os.getuid() and not (metadata.st_mode & 0o077):
+                return candidate / "herdr-overview.json"
+        except OSError:
+            pass
+    try:
+        base = Path.home() / ".cache" / "herdr-overview"
+        base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(base, 0o700)
+        return base / "snapshot.json"
+    except OSError:
+        return None
+
+
+def read_cache(path: Path) -> dict[str, Any] | None:
+    try:
+        cached = json.loads(path.read_text())
+        if not isinstance(cached, dict) or not isinstance(cached.get("created"), (int, float)):
+            return None
+        if now_epoch() - cached["created"] > CACHE_TTL_SECONDS:
+            return None
+        overview = cached.get("overview")
+        return overview if isinstance(overview, dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def now_epoch() -> float:
+    return datetime.now(timezone.utc).timestamp()
+
+
+def write_cache(path: Path, overview: dict[str, Any]) -> None:
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, prefix=".snapshot-", delete=False) as temporary:
+            temporary.write(json.dumps({"created": now_epoch(), "overview": overview}, separators=(",", ":")))
+            temporary_name = temporary.name
+        os.chmod(temporary_name, 0o600)
+        os.replace(temporary_name, path)
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def collect_overview() -> dict[str, Any]:
+    specs = [("local", "Local", ["herdr", "api", "snapshot"])]
+    remote_machines, catalog_error = list_machines()
+    specs.extend((machine_id, name, ["herdr", "--machine", machine_id, "api", "snapshot"]) for machine_id, name in remote_machines)
+    with ThreadPoolExecutor(max_workers=min(4, len(specs))) as executor:
+        machines = list(executor.map(lambda spec: collect_machine(*spec), specs))
+    if catalog_error:
+        machines.append(empty_machine("machine-catalog", "Saved machines", catalog_error))
+    overview = overview_from_machines(machines)
+    if not overview["available"]:
+        overview["error"] = "no Herdr machine snapshot available"
+    return overview
+
+
+def get_snapshot() -> dict[str, Any]:
+    """Return a fresh or very recent multi-machine overview without stale fallback."""
+    path = cache_location()
+    if path is None:
+        return collect_overview()
+    cached = read_cache(path)
+    if cached is not None:
+        return cached
+    lock_path = path.with_suffix(".lock")
+    try:
+        with lock_path.open("a+") as lock:
+            os.chmod(lock_path, 0o600)
+            deadline = time.monotonic() + LOCK_WAIT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        return unavailable("overview refresh in progress")
+                    time.sleep(0.05)
+            try:
+                cached = read_cache(path)
+                if cached is not None:
+                    return cached
+                overview = collect_overview()
+                write_cache(path, overview)
+                return overview
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        return collect_overview()
+
+
+def main() -> int:
+    print(json.dumps(get_snapshot(), separators=(",", ":"), ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "herdr-overview",
+  "name": "Herdr Overview",
+  "version": "1.0.0",
+  "author": "Alex",
+  "license": "UNLICENSED",
+  "description": "A live Herdr agent overview for the Omarchy bar.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Herdr Overview",
+    "description": "See active Herdr agents, output that needs review, and concise project status.",
+    "category": "AI",
+    "aliases": ["herdr", "agents", "overview"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
